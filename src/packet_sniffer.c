@@ -1,6 +1,8 @@
 #include "../include/packet_sniffer.h"
 
-void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u_char *packet) {
+void packet_handler(u_char *user_data __attribute__((unused)), 
+                  const struct pcap_pkthdr *pkthdr, 
+                  const u_char *packet) {
     static int packet_count = 0;
     packet_count++;
     
@@ -11,8 +13,8 @@ void packet_handler(u_char *user_data, const struct pcap_pkthdr *pkthdr, const u
     tm_info = localtime(&raw_time);
     strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
     
-    printf("\n\n=== Packet #%d Captured at %s.%06ld ===\n", 
-           packet_count, time_str, pkthdr->ts.tv_usec);
+    printf("\n\n=== Packet #%d Captured at %s.%06d ===\n", 
+           packet_count, time_str, (int)pkthdr->ts.tv_usec);
     printf("Packet length: %d bytes\n", pkthdr->len);
     printf("Captured length: %d bytes\n", pkthdr->caplen);
     

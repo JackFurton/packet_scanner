@@ -1,4 +1,15 @@
 #include "../include/packet_sniffer.h"
+#include "../include/packet_store.h"
+#include "../include/ui/ui.h"
+#include "../include/ui/stats.h"
+#include <signal.h>
+#include <pthread.h>
+#include <unistd.h> // For usleep
+
+// Global variables for capture thread
+static pcap_t *handle = NULL;
+static int running = 1;
+static pthread_t capture_thread;
 
 void list_devices() {
     pcap_if_t *alldevs;
@@ -43,11 +54,58 @@ void list_devices() {
     pcap_freealldevs(alldevs);
 }
 
+// New packet handler for UI mode
+void ui_packet_handler(u_char *user_data __attribute__((unused)), 
+                      const struct pcap_pkthdr *pkthdr, 
+                      const u_char *packet) {
+    // Check if we're paused - we access the ui state via an extern
+    extern int ui_paused;
+    
+    // Only store the packet if we're not paused
+    if (!ui_paused) {
+        int idx = packet_store_add(pkthdr, packet);
+        if (idx >= 0) {
+            // Update statistics for the captured packet
+            packet_info_t *info = packet_store_get(idx);
+            if (info) {
+                stats_add_packet(info);
+            }
+        }
+    }
+}
+
+// Signal handler for clean termination
+void signal_handler(int signum __attribute__((unused))) {
+    running = 0;
+    if (handle) {
+        pcap_breakloop(handle);
+    }
+}
+
+// Capture thread function
+void *capture_thread_func(void *arg __attribute__((unused))) {
+    // Start the packet capture loop
+    pcap_loop(handle, 0, ui_packet_handler, NULL);
+    
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t *handle;
     char *dev = NULL;
     pcap_if_t *alldevs, *d;
+    int use_ui = 1;  // Default to UI mode
+    
+    // Register signal handler
+    signal(SIGINT, signal_handler);
+    
+    // Check if UI mode is disabled
+    if (argc > 1 && strcmp(argv[1], "--no-ui") == 0) {
+        use_ui = 0;
+        // Shift arguments
+        argc--;
+        argv++;
+    }
     
     // Check for command line arguments
     if (argc > 1) {
@@ -59,8 +117,10 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         
-        // Display available interfaces
-        list_devices();
+        // Display available interfaces if not using UI
+        if (!use_ui) {
+            list_devices();
+        }
         
         // Try to find a suitable device with IPv4 address
         pcap_if_t *suitable_dev = NULL;
@@ -94,23 +154,27 @@ int main(int argc, char *argv[]) {
         
         if (suitable_dev) {
             dev = suitable_dev->name;
-            printf("\nSelected device: %s\n", dev);
+            if (!use_ui) {
+                printf("\nSelected device: %s\n", dev);
+            }
         } else if (alldevs != NULL) {
             // Fall back to the first device if no suitable device found
             dev = alldevs->name;
-            printf("\nUsing first available device: %s (no better option found)\n", dev);
+            if (!use_ui) {
+                printf("\nUsing first available device: %s (no better option found)\n", dev);
+            }
         } else {
             fprintf(stderr, "No devices found\n");
             return 1;
         }
-        
-        // We'll free the device list at the end
     }
     
-    printf("Sniffing on device: %s\n", dev);
+    if (!use_ui) {
+        printf("Sniffing on device: %s\n", dev);
+    }
     
     // Open the device for sniffing
-    handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    handle = pcap_open_live(dev, BUFSIZ, 1, 100, errbuf);
     if (handle == NULL) {
         fprintf(stderr, "Couldn't open device %s: %s\n", dev, errbuf);
         if (argc <= 1) pcap_freealldevs(alldevs);
@@ -176,12 +240,55 @@ int main(int argc, char *argv[]) {
         return 5;
     }
     
-    printf("Filter set to: %s\n", filter_exp);
-    printf("Starting packet capture. Press Ctrl+C to stop.\n");
-    printf("Waiting for packets...\n");
-    
-    // Start capturing packets
-    pcap_loop(handle, 0, packet_handler, NULL);
+    if (!use_ui) {
+        printf("Filter set to: %s\n", filter_exp);
+        printf("Starting packet capture. Press Ctrl+C to stop.\n");
+        printf("Waiting for packets...\n");
+        
+        // Start capturing packets in console mode
+        pcap_loop(handle, 0, packet_handler, NULL);
+    } else {
+        // Initialize the packet store
+        packet_store_init();
+        
+        // Initialize the UI
+        ui_init();
+        
+        // Create the capture thread
+        if (pthread_create(&capture_thread, NULL, capture_thread_func, NULL) != 0) {
+            fprintf(stderr, "Failed to create capture thread\n");
+            ui_cleanup();
+            packet_store_clear();
+            pcap_close(handle);
+            if (argc <= 1) pcap_freealldevs(alldevs);
+            return 6;
+        }
+        
+        // Main UI loop
+        while (running) {
+            // Process user input
+            if (ui_process_input()) {
+                running = 0;
+                break;
+            }
+            
+            // Update the UI
+            ui_update();
+            
+            // Sleep a bit to reduce CPU usage
+            usleep(10000);  // 10ms
+        }
+        
+        // Clean up UI
+        ui_cleanup();
+        
+        // Stop the capture thread
+        pcap_breakloop(handle);
+        pthread_join(capture_thread, NULL);
+        
+        // Clear packet store
+        packet_store_clear();
+    }
     
     // Clean up
     pcap_freecode(&fp);
